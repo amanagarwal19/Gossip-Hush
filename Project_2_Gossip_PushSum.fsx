@@ -27,6 +27,10 @@ let mutable actorNeighbours = [||]
 // A dictionary to store if the actor is live or has converged
 let actorTable = new Dictionary<IActorRef, bool>()
 
+//Pushsum parameters
+let mutable w = 1.0
+let terminationThreshold = (10.00 ** -10.00)
+
 type Messages = 
     | ActorInitialize of IActorRef []
     | VariableIntitialize of int
@@ -47,7 +51,9 @@ type Messages =
     | Begin
     | SetNeighbours of IActorRef []
     | ReSpawnTerminatedNeighbours
-
+    | INIT_PUSHUM of float
+    | BeingPushSum 
+    | ReportTermination
 
 type TopologyType = 
     | Gossip of String
@@ -93,6 +99,13 @@ let worker(mailbox: Actor<_>)=
     let mutable neighbours:IActorRef[] = [||]
     let mutable rumourHeard = 0;
 
+   
+    // Pushum parameters
+    let mutable s=0.0;
+    let mutable terminated = false;
+    let mutable consecutiveRounds = 0;
+    let mutable sumEstimationRatioDiff = 0.0
+
     let rec loop()=actor{
         let! msg = mailbox.Receive()
         let sender = mailbox.Sender()
@@ -103,6 +116,8 @@ let worker(mailbox: Actor<_>)=
         
 
         match msg with
+
+        // ------------------  MESSAGE PATTERN FOR GOSSIP  --------------------
 
         // Setting the neighbours list to the values returned by the supervisor
         | SetNeighbours nbs ->
@@ -127,13 +142,70 @@ let worker(mailbox: Actor<_>)=
                 supervisorRefGlobal <! FinishedRumor //Report to the supervisor
                 actorTable.[mailbox.Self] <- true // Set your finsihed status to true
             rumourHeard <- rumourHeard + 1 //Increment its rumour
+        
+
+
+
+
+        // ------------------  MESSAGE PATTERN FOR GOSSIP  --------------------
+
+
+        | INIT_PUSHUM value ->  
+            s <- value
+
+        | BeingPushSum -> 
+            printfn "%d" numNodes
+            s <- s / 2.0
+            w <- w / 2.0
+
+            let nextRandomActor = Random().Next(0,neighbours.Length)
+
+            neighbours.[nextRandomActor] <! CalculatePushSum (s,w,terminationThreshold)
+
+        
+        | CalculatePushSum (s1,w1,terminationThreshold) ->
+
+            // If the calling actor is dead, make NO CHANGEs to variables and call new actor
+            
+            if terminated then
+                let idx = Random().Next(0,neighbours.Length)
+                neighbours.[idx] <! CalculatePushSum (s,w,terminationThreshold)
+
+            // Update values of pushsum and check convergence
+            else
+
+                // RECEIVE FUNCTIONALITY
+
+                // Update the values for the current actor
+                let newS = s + s1
+                let newW = w + w1
+
+                // Calculate ratio difference from previous call
+                sumEstimationRatioDiff <- abs((s/w) - (newS/newW))
+
+                if sumEstimationRatioDiff <= terminationThreshold then
+
+                    consecutiveRounds <- consecutiveRounds + 1
+
+                elif sumEstimationRatioDiff > terminationThreshold then // Reset the counter if the contiuity breaks
+
+                    consecutiveRounds <- 0
+
+                if consecutiveRounds = 3 then // Terminate the actor and report to supervisor
+                    
+                    supervisorRefGlobal<!ReportTermination
+                    terminated <- true
+            
+                // SEND FUNCTIONALITY
+
+                s <- newS / 2.0
+                w <- newW / 2.0
+
+                let idx = Random().Next(0,neighbours.Length)
+                neighbours.[idx] <! CalculatePushSum (s,w,terminationThreshold)
+                
+
         |(_) -> ()
-
-
-
-
-
-
 
         return! loop()
 
@@ -148,8 +220,10 @@ let createActors(n:int) =
         let name:string="Worker" + string(i)
         let actorRef = spawn system (name) worker
         actorNeighbours.[i] <- actorRef 
-        // actorNeighbours.[i] <! InitializeVariables i //for pushsum
         actorTable.Add(actorNeighbours.[i], false)
+
+        // INITIALISING PUSH SUM Actor variables
+        actorNeighbours.[i] <! INIT_PUSHUM ((float)i) //for pushsum
     actorNeighbours
 
 // Create and set neighbours for LINE topology    
@@ -179,11 +253,13 @@ let setFullNeighbours (actors:IActorRef[])=
 
 // Create and set neighbours for 3D GRID topology    
 let set3DNeighbours(actors:IActorRef[],n:int,side:int)=
-    printfn "Creating %d actors....." n
+    printfn "Creating %d actors to fit in the 3d grid (this may take a while)..." n
     
     let mutable nblist = [||]
     let mutable c =0;
     for x in [0..n] do
+        if (x % (n/5)) = 0 then printfn "Loading...(%d/%d) actors created" x numNodes
+        
         if (x-1>=0)  then nblist<- (Array.append nblist [|actors.[x-1]|])
         if (x+1<n)  then nblist<- (Array.append nblist [|actors.[x+1]|])
         if (x-side>=0) then nblist<- (Array.append nblist [|actors.[x-side]|])
@@ -254,11 +330,13 @@ let supervisor (mailbox:Actor<_>) =
                 timer.Start()
                 match protocol with
                 | "gossip" -> 
-                 
+                   
                     actors.[leaderActor]<!StartGossip
                     ReSpawningActorRef<! ReSpawnTerminatedNeighbours
  
-                | "push-sum" -> printfn "%s Pending implementation " protocol
+                | "push-sum" -> 
+                    printf "Done"       
+                    actors.[leaderActor]<!BeingPushSum
 
                 |(_)-> printfn "Incorrect protocol"
  
@@ -279,7 +357,9 @@ let supervisor (mailbox:Actor<_>) =
                     printf "Done"
                     actors.[leaderActor]<!TransmitRumor
 
-                | "push-sum" -> printfn "%s Pending implementation " protocol
+                | "push-sum" -> 
+                    printf "Done"       
+                    actors.[leaderActor]<!BeingPushSum
 
                 |(_)-> printfn "Incorrect protocol"
 
@@ -310,7 +390,9 @@ let supervisor (mailbox:Actor<_>) =
                     actors.[leaderActor]<!StartGossip
                     ReSpawningActorRef<! ReSpawnTerminatedNeighbours
  
-                | "push-sum" -> printfn "%s Pending implementation " protocol
+                | "push-sum" -> 
+                    printf "Done"       
+                    actors.[leaderActor]<!BeingPushSum
 
                 |(_)-> printfn "Incorrect protocol"
 
@@ -339,16 +421,13 @@ let supervisor (mailbox:Actor<_>) =
                     actors.[leaderActor]<!StartGossip
                     ReSpawningActorRef<! ReSpawnTerminatedNeighbours
  
-                | "push-sum" -> printfn "%s Pending implementation " protocol
+                | "push-sum" -> 
+                    printf "Done"       
+                    actors.[leaderActor]<!BeingPushSum
 
                 |(_)-> printfn "Incorrect protocol"
             
             |(_) -> printfn "Incorrect topology"    
-
-
-            // |"full"->
-            // |"3D"->
-            // |"Imp3D"->
 
         |FinishedRumor ->
             finishedWorkers <- finishedWorkers+1
@@ -361,6 +440,21 @@ let supervisor (mailbox:Actor<_>) =
                 let endingTime = timer.Elapsed.TotalMilliseconds
                 bossRefGlobal<! Converged endingTime
                 
+
+        // --------------- MESSAGE MATCHING FOR PUSH SUM ------------
+
+        | ReportTermination -> 
+
+            finishedWorkers <- finishedWorkers+1
+
+            // Progress Tracking
+            printfn "Total workers finished %d" finishedWorkers
+
+            // Update the boss that all workers have converged
+            if(finishedWorkers = numNodes) then 
+                timer.Stop()
+                let endingTime = timer.Elapsed.TotalMilliseconds
+                bossRefGlobal<! Converged endingTime
 
         |(_) -> printfn "Incorrect message to supervisor"
 
